@@ -133,10 +133,14 @@ def get_patterns_in_config(filter):
         # channels might have dots in their names, so we'll strip type from right and server
         # from left. Lets hope that users doesn't use dots in server names.
         name, _, type = name.rpartition('.')
-        if type not in ('op', 'halfop', 'voice'):
+
+        server, _, channel = name.partition('.')
+
+        prefix_modes = _get_server_prefix_modes(server)
+        if type not in prefix_modes:
             # invalid option
             continue
-        server, _, channel = name.partition('.')
+
         value = weechat.infolist_string(infolist, 'value')
         if not value:
             continue
@@ -150,6 +154,58 @@ def get_patterns_in_config(filter):
     weechat.infolist_free(infolist)
     return d
 
+def _get_server_prefix_modes(server):
+    """ get available prefix chars from an IRC server
+    :param server Server identification as string. ie: freenode. (how it shows up in buffers)
+    :returns array of available prefix chars
+    """
+    try:
+        def __get_prefix_modes():
+            return weechat.infolist_string(ptr_infolist, "prefix_modes")
+        def __get_prefix_chars():
+            return weechat.infolist_string(ptr_infolist, "prefix_chars")
+
+        ptr_infolist = weechat.infolist_get("irc_server", "", server)
+        infolist = weechat.infolist_next(ptr_infolist)
+        if infolist:
+            prefix_modes = __get_prefix_modes()
+            prefix_chars = __get_prefix_chars()
+            return (list(prefix_modes), list(prefix_chars)) if prefix_modes and prefix_chars else ([], [])
+        else:
+            debug("error fetching prefix_chars for server: %s", server)
+            return ([], [])
+    finally:
+        weechat.infolist_free(ptr_infolist)
+
+def _get_prefix_mode_from_prefix_char(server, prefix_char):
+    prefix_modes, prefix_chars = _get_server_prefix_modes(server)
+    if prefix_char not in prefix_chars:
+        return None
+    return prefix_modes[prefix_chars.index(prefix_char)]
+
+def _is_able_to_mode(server, my_mode, give_mode):
+    prefix_modes, prefix_chars = _get_server_prefix_modes(server)
+
+    if not prefix_modes or not prefix_chars:
+        return False
+
+    if len(prefix_modes)>0 and ('o' not in prefix_modes or 'v' not in prefix_modes):
+        debug("server is weird, prefix_modes: %s, prefix_chars: %s", prefix_modes, prefix_chars)
+        return False
+
+
+    operator_index = prefix_modes.index('o')
+
+    if my_mode in prefix_modes and give_mode in prefix_modes:
+        my_mode_index = prefix_modes.index(my_mode)
+        give_mode_index = prefix_modes.index(give_mode)
+
+        if my_mode_index <= operator_index:
+            return my_mode_index <= give_mode_index
+        else:
+            return my_mode_index < give_mode_index
+    return False
+
 ########################
 ### Script callbacks ###
 
@@ -157,17 +213,30 @@ def join_cb(data, signal, signal_data):
     #debug('JOIN: %s %s', signal, signal_data)
     prefix, _, channel = signal_data.split()
     prefix = prefix[1:].lower()
+
     if channel[0] == ':':
         channel = channel[1:]
+
     server = signal[:signal.find(',')]
-    for type in ('op', 'halfop', 'voice'):
+
+    my_nickname = weechat.info_get("irc_nick", server)
+
+    prefix_modes, _ = _get_server_prefix_modes(server)
+    for type in prefix_modes:
         list = get_config_list('.'.join((server.lower(), channel.lower(), type)))
         for pattern in list:
             #debug('checking: %r - %r', prefix, pattern)
             if fnmatch(prefix, pattern):
                 buffer = weechat.buffer_search('irc', '%s.%s' %(server, channel))
                 if buffer:
-                    weechat.command(buffer, '/%s %s' %(type, prefix[:prefix.find('!')]))
+                    # Valid buffer, let's fetch my prefix char in given buffer's nicklist
+                    # and use ISUPPORT numeric to check if I'm able to give this mode or not
+                    # http://www.irc.org/tech_docs/draft-brocklesby-irc-isupport-03.txt
+                    ptr_my_nickname = weechat.nicklist_search_nick(buffer, "", my_nickname)
+                    my_prefix_char_in_channel = weechat.nicklist_nick_get_string(buffer, ptr_my_nickname, "prefix")
+                    my_prefix_mode_in_channel = _get_prefix_mode_from_prefix_char(server, my_prefix_char_in_channel)
+                    if _is_able_to_mode(server, my_prefix_mode_in_channel, type):
+                        weechat.command(buffer, '/mode %s +%s %s' %(channel, type, prefix[:prefix.find('!')]))
                 return WEECHAT_RC_OK
     return WEECHAT_RC_OK
 
@@ -189,8 +258,11 @@ def command(data, buffer, args):
                 return WEECHAT_RC_OK
 
             type, match = args[1], args[2:]
-            if type not in ('op', 'voice', 'halfop'):
-                raise ValueError("valid values are 'op', 'halfop' and 'voice'.")
+            valid_server_prefixes_for_user, _ = _get_server_prefix_modes(server)
+            if not valid_server_prefixes_for_user:
+                raise ValueError("could not fetch valid prefix modes from server (o for op, v for voice etc")
+            if type not in valid_server_prefixes_for_user:
+                raise ValueError("valid values are %s", ",".join(valid_server_prefixes_for_user))
             if not match:
                 raise ValueError("missing pattern or nick.")
             match = match[0].lower()
